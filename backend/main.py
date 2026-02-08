@@ -1,11 +1,13 @@
 import os
 import math
+import uuid
 import httpx
 from dotenv import load_dotenv
 from datetime import datetime, timedelta
 from contextlib import asynccontextmanager
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import PlainTextResponse
 from pydantic import BaseModel
 from typing import Optional
 
@@ -13,8 +15,11 @@ from database import (
     init_db, close_db, get_consent, set_consent,
     delete_athlete_data, store_training_snapshot, store_race_result,
     get_dataset_stats, export_training_dataset,
+    store_tokens, store_pending_prediction, expire_old_predictions,
+    store_webhook_state, get_webhook_state,
 )
 from training_processor import process_training_data, detect_race_results
+from webhook_handler import process_activity_event
 
 load_dotenv()
 
@@ -34,6 +39,7 @@ app = FastAPI(title="Race Prophet API", lifespan=lifespan)
 STRAVA_CLIENT_ID = os.environ.get("STRAVA_CLIENT_ID", "")
 STRAVA_CLIENT_SECRET = os.environ.get("STRAVA_CLIENT_SECRET", "")
 FRONTEND_URL = os.environ.get("FRONTEND_URL", "http://localhost:5173")
+WEBHOOK_VERIFY_TOKEN = os.environ.get("WEBHOOK_VERIFY_TOKEN", str(uuid.uuid4()))
 
 app.add_middleware(
     CORSMiddleware,
@@ -77,6 +83,15 @@ async def exchange_token(code: str = Query(...)):
     if resp.status_code != 200:
         raise HTTPException(status_code=400, detail=f"Strava token error: {resp.text}")
     data = resp.json()
+
+    # Store encrypted tokens for webhook use
+    await store_tokens(
+        athlete_id=data["athlete"]["id"],
+        access_token=data["access_token"],
+        refresh_token=data["refresh_token"],
+        expires_at=data["expires_at"],
+    )
+
     return {
         "access_token": data["access_token"],
         "refresh_token": data["refresh_token"],
@@ -109,6 +124,128 @@ async def refresh_token(refresh_token: str = Query(...)):
         "access_token": data["access_token"],
         "refresh_token": data["refresh_token"],
         "expires_at": data["expires_at"],
+    }
+
+
+# --- Strava Webhook ---
+
+@app.get("/api/strava/webhook")
+async def webhook_validation(request: Request):
+    """
+    Handle Strava webhook subscription validation.
+    Strava sends a GET with hub.verify_token, hub.challenge, hub.mode.
+    We must respond with {"hub.challenge": <value>}.
+    """
+    params = request.query_params
+    mode = params.get("hub.mode")
+    token = params.get("hub.verify_token")
+    challenge = params.get("hub.challenge")
+
+    if mode == "subscribe" and token == WEBHOOK_VERIFY_TOKEN:
+        print(f"Webhook validated, challenge: {challenge}")
+        return {"hub.challenge": challenge}
+
+    raise HTTPException(status_code=403, detail="Verification failed")
+
+
+@app.post("/api/strava/webhook")
+async def webhook_event(request: Request):
+    """
+    Receive Strava webhook events.
+    Event types: activity.create, activity.update, activity.delete,
+                 athlete.update, athlete.deauthorize
+    """
+    body = await request.json()
+    print(f"Webhook event: {body}")
+
+    object_type = body.get("object_type")
+    aspect_type = body.get("aspect_type")
+    object_id = body.get("object_id")
+    athlete_id = body.get("owner_id")
+
+    # We only care about new or updated activities
+    if object_type == "activity" and aspect_type in ("create", "update"):
+        try:
+            result = await process_activity_event(athlete_id, object_id)
+            print(f"Webhook processing result: {result}")
+        except Exception as e:
+            print(f"Webhook processing error: {e}")
+
+    # Handle deauthorization
+    elif object_type == "athlete" and aspect_type == "update":
+        updates = body.get("updates", {})
+        if updates.get("authorized") == "false":
+            print(f"Athlete {athlete_id} deauthorized")
+            try:
+                await delete_athlete_data(athlete_id)
+            except Exception as e:
+                print(f"Deauth cleanup error: {e}")
+
+    # Always return 200 to acknowledge receipt
+    return {"status": "ok"}
+
+
+@app.post("/api/strava/setup-webhook")
+async def setup_webhook(admin_key: str = Query(...)):
+    """
+    Register the webhook subscription with Strava.
+    Only needs to be called once. Requires admin key.
+    """
+    expected = os.environ.get("ADMIN_KEY", "")
+    if not expected or admin_key != expected:
+        raise HTTPException(status_code=403, detail="Invalid admin key")
+
+    callback_url = os.environ.get("WEBHOOK_CALLBACK_URL", "")
+    if not callback_url:
+        # Auto-detect from Railway
+        railway_url = os.environ.get("RAILWAY_PUBLIC_DOMAIN", "")
+        if railway_url:
+            callback_url = f"https://{railway_url}/api/strava/webhook"
+        else:
+            raise HTTPException(status_code=500, detail="WEBHOOK_CALLBACK_URL not configured")
+
+    async with httpx.AsyncClient() as client:
+        resp = await client.post(
+            "https://www.strava.com/api/v3/push_subscriptions",
+            data={
+                "client_id": STRAVA_CLIENT_ID,
+                "client_secret": STRAVA_CLIENT_SECRET,
+                "callback_url": callback_url,
+                "verify_token": WEBHOOK_VERIFY_TOKEN,
+            },
+        )
+
+    if resp.status_code == 201:
+        data = resp.json()
+        await store_webhook_state(data["id"], WEBHOOK_VERIFY_TOKEN)
+        return {"status": "created", "subscription_id": data["id"]}
+    elif resp.status_code == 409:
+        return {"status": "already_exists", "detail": resp.text}
+    else:
+        raise HTTPException(status_code=resp.status_code, detail=resp.text)
+
+
+@app.get("/api/strava/webhook-status")
+async def webhook_status(admin_key: str = Query(...)):
+    """Check current webhook subscription status."""
+    expected = os.environ.get("ADMIN_KEY", "")
+    if not expected or admin_key != expected:
+        raise HTTPException(status_code=403, detail="Invalid admin key")
+
+    # Check with Strava
+    async with httpx.AsyncClient() as client:
+        resp = await client.get(
+            "https://www.strava.com/api/v3/push_subscriptions",
+            params={
+                "client_id": STRAVA_CLIENT_ID,
+                "client_secret": STRAVA_CLIENT_SECRET,
+            },
+        )
+
+    local_state = await get_webhook_state()
+    return {
+        "strava_subscriptions": resp.json() if resp.status_code == 200 else [],
+        "local_state": local_state,
     }
 
 
@@ -211,7 +348,8 @@ async def get_activities(
         runs.append(run)
 
     weekly_miles = [d / 1.60934 for d in weekly_distances.values()] if weekly_distances else [0]
-    avg_weekly_miles = sum(weekly_miles) / len(weekly_miles)
+    # Divide by total weeks requested, not just weeks with runs (zero weeks matter)
+    avg_weekly_miles = sum(weekly_miles) / weeks
 
     races = [r for r in runs if r["is_race"]]
     best_efforts = find_best_efforts(runs)
@@ -396,6 +534,8 @@ class ContributeRequest(BaseModel):
     ref_date: Optional[str] = None
     goal_distance_km: float
     predicted_time_seconds: int
+    goal_race_name: Optional[str] = None
+    goal_race_date: Optional[str] = None
     age: Optional[int] = None
     experience: Optional[str] = "intermediate"
     gender: Optional[str] = None
@@ -403,7 +543,7 @@ class ContributeRequest(BaseModel):
 
 @app.post("/api/data/contribute")
 async def contribute_data(req: ContributeRequest):
-    """Store a training snapshot when a user makes a prediction."""
+    """Store training snapshot + create pending prediction for webhook matching."""
     opted_in = await get_consent(req.athlete_id)
     if not opted_in:
         raise HTTPException(status_code=403, detail="User has not opted in")
@@ -440,9 +580,26 @@ async def contribute_data(req: ContributeRequest):
         gender=req.gender,
     )
 
+    # Create pending prediction for webhook auto-matching
+    pending_id = await store_pending_prediction(
+        athlete_id=req.athlete_id,
+        snapshot_id=snapshot_id,
+        ref_distance_km=req.ref_distance_km,
+        ref_time_seconds=req.ref_time_seconds,
+        ref_date=req.ref_date,
+        goal_distance_km=req.goal_distance_km,
+        predicted_time_seconds=req.predicted_time_seconds,
+        goal_race_name=req.goal_race_name,
+        goal_race_date=req.goal_race_date,
+    )
+
+    # Clean up expired predictions
+    await expire_old_predictions()
+
     return {
         "status": "ok",
         "snapshot_id": snapshot_id,
+        "pending_prediction_id": pending_id,
         "training_summary": {
             "avg_weekly_miles": training_data["avg_weekly_miles"],
             "total_runs": training_data["total_runs"],
@@ -467,7 +624,6 @@ class RaceResultRequest(BaseModel):
 
 @app.post("/api/data/race-result")
 async def record_race_result(req: RaceResultRequest):
-    """Record an actual race result to compare against prediction."""
     opted_in = await get_consent(req.athlete_id)
     if not opted_in:
         raise HTTPException(status_code=403, detail="User has not opted in")
@@ -483,6 +639,7 @@ async def record_race_result(req: RaceResultRequest):
         goal_date=req.goal_date,
         goal_elevation_gain_ft=req.goal_elevation_gain_ft,
         predicted_time_seconds=req.predicted_time_seconds,
+        source="manual",
     )
 
     error_min = None
@@ -503,7 +660,6 @@ async def check_for_race(
     goal_distance_km: float = Query(...),
     after_date: str = Query(...),
 ):
-    """Check if a user has completed their goal race since a given date."""
     after_ts = int(datetime.strptime(after_date, "%Y-%m-%d").timestamp())
     all_activities = []
     page = 1

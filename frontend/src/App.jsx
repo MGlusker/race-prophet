@@ -45,6 +45,8 @@ export default function App() {
   const [age, setAge] = useState('');
   const [experience, setExperience] = useState('intermediate');
   const [selectedStravaRace, setSelectedStravaRace] = useState(null);
+  const [goalRaceName, setGoalRaceName] = useState('');
+  const [goalRaceDate, setGoalRaceDate] = useState('');
 
   // Results
   const [result, setResult] = useState(null);
@@ -234,6 +236,8 @@ export default function App() {
             ref_date: selectedStravaRace?.date || null,
             goal_distance_km: DISTANCES[goalDistIdx].km,
             predicted_time_seconds: prediction.predicted_seconds,
+            goal_race_name: goalRaceName || null,
+            goal_race_date: goalRaceDate || null,
             age: parseInt(age) || null,
             experience,
             gender: stravaData?.athlete?.sex || null,
@@ -548,6 +552,35 @@ export default function App() {
                 </button>
               ))}
             </div>
+          </div>
+
+          <div className="race-details-section">
+            <div className="race-details-header">
+              <span className="label" style={{ marginBottom: 0 }}>Training for a specific race?</span>
+              <span className="hint-inline">Optional — helps us track your prediction accuracy</span>
+            </div>
+            <div className="row" style={{ marginTop: 8 }}>
+              <div className="field" style={{ flex: 2 }}>
+                <input type="text" value={goalRaceName}
+                  onChange={(e) => setGoalRaceName(e.target.value)}
+                  className="input" placeholder="e.g. LA Marathon" />
+              </div>
+              <div className="field" style={{ flex: 1 }}>
+                <input type="date" value={goalRaceDate}
+                  onChange={(e) => setGoalRaceDate(e.target.value)}
+                  className="input input-date" />
+              </div>
+            </div>
+            {goalRaceDate && (
+              <span className="hint" style={{ marginTop: 4 }}>
+                {(() => {
+                  const days = Math.ceil((new Date(goalRaceDate) - new Date()) / (1000 * 60 * 60 * 24));
+                  if (days > 0) return `🏃 ${days} days until race day`;
+                  if (days === 0) return '🏁 Race day!';
+                  return `Race was ${Math.abs(days)} days ago`;
+                })()}
+              </span>
+            )}
           </div>
 
           <div className="divider" />
@@ -1119,6 +1152,30 @@ export default function App() {
           outline: none;
         }
         .input:focus { border-color: var(--accent); }
+        .input-date {
+          color-scheme: dark;
+        }
+        .input-date::-webkit-calendar-picker-indicator {
+          filter: invert(0.7);
+          cursor: pointer;
+        }
+        .race-details-section {
+          margin-top: 16px;
+          padding: 14px 16px;
+          background: var(--surface);
+          border-radius: 10px;
+          border: 1px dashed var(--border);
+        }
+        .race-details-header {
+          display: flex;
+          align-items: baseline;
+          gap: 10px;
+          margin-bottom: 4px;
+        }
+        .hint-inline {
+          font-size: 10px;
+          color: var(--text-faint);
+        }
         .hint {
           font-size: 10px;
           color: var(--text-faint);
