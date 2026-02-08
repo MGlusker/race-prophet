@@ -3,14 +3,32 @@ import math
 import httpx
 from dotenv import load_dotenv
 from datetime import datetime, timedelta
+from contextlib import asynccontextmanager
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from typing import Optional
 
+from database import (
+    init_db, close_db, get_consent, set_consent,
+    delete_athlete_data, store_training_snapshot, store_race_result,
+    get_dataset_stats, export_training_dataset,
+)
+from training_processor import process_training_data, detect_race_results
+
 load_dotenv()
 
-app = FastAPI(title="Race Prophet API")
+
+# --- App Lifecycle ---
+
+@asynccontextmanager
+async def lifespan(app):
+    await init_db()
+    yield
+    await close_db()
+
+
+app = FastAPI(title="Race Prophet API", lifespan=lifespan)
 
 # --- Config ---
 STRAVA_CLIENT_ID = os.environ.get("STRAVA_CLIENT_ID", "")
@@ -29,7 +47,6 @@ app.add_middleware(
 
 @app.get("/api/strava/auth-url")
 def get_auth_url():
-    """Return the Strava OAuth authorization URL."""
     if not STRAVA_CLIENT_ID:
         raise HTTPException(status_code=500, detail="STRAVA_CLIENT_ID not configured")
     redirect_uri = f"{FRONTEND_URL}/callback"
@@ -47,7 +64,6 @@ def get_auth_url():
 
 @app.post("/api/strava/token")
 async def exchange_token(code: str = Query(...)):
-    """Exchange authorization code for access token."""
     async with httpx.AsyncClient() as client:
         resp = await client.post(
             "https://www.strava.com/oauth/token",
@@ -76,7 +92,6 @@ async def exchange_token(code: str = Query(...)):
 
 @app.post("/api/strava/refresh")
 async def refresh_token(refresh_token: str = Query(...)):
-    """Refresh an expired access token."""
     async with httpx.AsyncClient() as client:
         resp = await client.post(
             "https://www.strava.com/oauth/token",
@@ -101,7 +116,6 @@ async def refresh_token(refresh_token: str = Query(...)):
 
 @app.get("/api/strava/athlete")
 async def get_athlete(access_token: str = Query(...)):
-    """Get full athlete profile (includes weight, age info)."""
     async with httpx.AsyncClient() as client:
         resp = await client.get(
             "https://www.strava.com/api/v3/athlete",
@@ -111,7 +125,6 @@ async def get_athlete(access_token: str = Query(...)):
         raise HTTPException(status_code=400, detail="Failed to fetch athlete")
     data = resp.json()
 
-    # Calculate age from birthday if available
     age = None
     if data.get("birthday"):
         try:
@@ -128,8 +141,9 @@ async def get_athlete(access_token: str = Query(...)):
         "city": data.get("city", ""),
         "state": data.get("state", ""),
         "country": data.get("country", ""),
-        "weight": data.get("weight"),  # kg
+        "weight": data.get("weight"),
         "age": age,
+        "sex": data.get("sex"),
     }
 
 
@@ -138,7 +152,6 @@ async def get_activities(
     access_token: str = Query(...),
     weeks: int = Query(default=12, ge=1, le=52),
 ):
-    """Fetch recent run activities and compute stats."""
     after_ts = int((datetime.now() - timedelta(weeks=weeks)).timestamp())
     all_activities = []
     page = 1
@@ -165,7 +178,6 @@ async def get_activities(
             if len(batch) < 100:
                 break
 
-    # Process activities
     runs = []
     weekly_distances = {}
 
@@ -177,7 +189,6 @@ async def get_activities(
         time_sec = act["moving_time"]
         date = act["start_date"][:10]
 
-        # Determine week key (ISO week)
         dt = datetime.strptime(date, "%Y-%m-%d")
         week_key = dt.strftime("%Y-W%W")
         weekly_distances[week_key] = weekly_distances.get(week_key, 0) + dist_km
@@ -194,19 +205,14 @@ async def get_activities(
             "pace_per_km": format_time(int(time_sec / dist_km)) if dist_km > 0 else "N/A",
             "elevation_gain": act.get("total_elevation_gain", 0),
             "average_heartrate": act.get("average_heartrate"),
-            "workout_type": act.get("workout_type"),  # 1=race in Strava
+            "workout_type": act.get("workout_type"),
         }
-
-        # Flag likely races
         run["is_race"] = act.get("workout_type") == 1
-
         runs.append(run)
 
-    # Compute weekly mileage average
     weekly_miles = [d / 1.60934 for d in weekly_distances.values()] if weekly_distances else [0]
     avg_weekly_miles = sum(weekly_miles) / len(weekly_miles)
 
-    # Find best race-like efforts for common distances
     races = [r for r in runs if r["is_race"]]
     best_efforts = find_best_efforts(runs)
 
@@ -225,7 +231,6 @@ async def get_activities(
 
 
 def find_best_efforts(runs):
-    """Find the fastest effort near each standard race distance."""
     targets = {
         "1 Mile": 1.60934,
         "5K": 5.0,
@@ -235,13 +240,12 @@ def find_best_efforts(runs):
     }
     best = {}
     for label, target_km in targets.items():
-        tolerance = 0.15  # 15% tolerance
+        tolerance = 0.15
         candidates = [
             r for r in runs
             if abs(r["distance_km"] - target_km) / target_km <= tolerance
         ]
         if candidates:
-            # Fastest by time (normalized to exact distance)
             fastest = min(candidates, key=lambda r: r["time_seconds"] / r["distance_km"])
             best[label] = {
                 "distance_km": target_km,
@@ -295,7 +299,6 @@ class PredictionRequest(BaseModel):
 
 @app.post("/api/predict")
 def predict(req: PredictionRequest):
-    """Run prediction with Riegel formula + adjustments."""
     exponent = 1.06
 
     if req.weekly_miles:
@@ -336,7 +339,6 @@ def predict(req: PredictionRequest):
     pace_per_mile = (adjusted / req.goal_distance_km) * 1.60934
     pace_per_km = adjusted / req.goal_distance_km
 
-    # Equivalent times for all distances
     equivalents = {}
     for label, dist in DISTANCES.items():
         eq_raw = req.race_time_seconds * math.pow(dist / req.race_distance_km, exponent)
@@ -359,6 +361,189 @@ def predict(req: PredictionRequest):
         "pace_per_km": format_time(round(pace_per_km)),
         "equivalents": equivalents,
     }
+
+
+# --- Data Collection Endpoints ---
+
+class ConsentRequest(BaseModel):
+    athlete_id: int
+    opted_in: bool
+
+
+@app.post("/api/data/consent")
+async def update_consent(req: ConsentRequest):
+    await set_consent(req.athlete_id, req.opted_in)
+    return {"status": "ok", "opted_in": req.opted_in}
+
+
+@app.get("/api/data/consent")
+async def check_consent(athlete_id: int = Query(...)):
+    opted_in = await get_consent(athlete_id)
+    return {"opted_in": opted_in}
+
+
+@app.delete("/api/data/my-data")
+async def delete_my_data(athlete_id: int = Query(...)):
+    await delete_athlete_data(athlete_id)
+    return {"status": "deleted"}
+
+
+class ContributeRequest(BaseModel):
+    athlete_id: int
+    access_token: str
+    ref_distance_km: float
+    ref_time_seconds: int
+    ref_date: Optional[str] = None
+    goal_distance_km: float
+    predicted_time_seconds: int
+    age: Optional[int] = None
+    experience: Optional[str] = "intermediate"
+    gender: Optional[str] = None
+
+
+@app.post("/api/data/contribute")
+async def contribute_data(req: ContributeRequest):
+    """Store a training snapshot when a user makes a prediction."""
+    opted_in = await get_consent(req.athlete_id)
+    if not opted_in:
+        raise HTTPException(status_code=403, detail="User has not opted in")
+
+    # Fetch recent activities for training snapshot
+    after_ts = int((datetime.now() - timedelta(weeks=16)).timestamp())
+    all_activities = []
+    page = 1
+
+    async with httpx.AsyncClient() as client:
+        while True:
+            resp = await client.get(
+                "https://www.strava.com/api/v3/athlete/activities",
+                headers={"Authorization": f"Bearer {req.access_token}"},
+                params={"after": after_ts, "per_page": 100, "page": page},
+            )
+            if resp.status_code != 200:
+                break
+            batch = resp.json()
+            if not batch:
+                break
+            all_activities.extend(batch)
+            page += 1
+            if len(batch) < 100:
+                break
+
+    training_data = process_training_data(all_activities, weeks=16)
+
+    snapshot_id = await store_training_snapshot(
+        strava_athlete_id=req.athlete_id,
+        training_data=training_data,
+        age=req.age,
+        experience_level=req.experience,
+        gender=req.gender,
+    )
+
+    return {
+        "status": "ok",
+        "snapshot_id": snapshot_id,
+        "training_summary": {
+            "avg_weekly_miles": training_data["avg_weekly_miles"],
+            "total_runs": training_data["total_runs"],
+            "longest_run_mi": training_data["longest_run_mi"],
+        },
+    }
+
+
+class RaceResultRequest(BaseModel):
+    athlete_id: int
+    access_token: str
+    snapshot_id: Optional[int] = None
+    ref_distance_km: float
+    ref_time_seconds: int
+    ref_date: Optional[str] = None
+    goal_distance_km: float
+    goal_time_seconds: int
+    goal_date: str
+    goal_elevation_gain_ft: Optional[float] = None
+    predicted_time_seconds: Optional[int] = None
+
+
+@app.post("/api/data/race-result")
+async def record_race_result(req: RaceResultRequest):
+    """Record an actual race result to compare against prediction."""
+    opted_in = await get_consent(req.athlete_id)
+    if not opted_in:
+        raise HTTPException(status_code=403, detail="User has not opted in")
+
+    result_id = await store_race_result(
+        strava_athlete_id=req.athlete_id,
+        snapshot_id=req.snapshot_id,
+        ref_distance_km=req.ref_distance_km,
+        ref_time_seconds=req.ref_time_seconds,
+        ref_date=req.ref_date,
+        goal_distance_km=req.goal_distance_km,
+        goal_time_seconds=req.goal_time_seconds,
+        goal_date=req.goal_date,
+        goal_elevation_gain_ft=req.goal_elevation_gain_ft,
+        predicted_time_seconds=req.predicted_time_seconds,
+    )
+
+    error_min = None
+    if req.predicted_time_seconds:
+        error_sec = req.predicted_time_seconds - req.goal_time_seconds
+        error_min = round(error_sec / 60, 1)
+
+    return {
+        "status": "ok",
+        "result_id": result_id,
+        "prediction_error_minutes": error_min,
+    }
+
+
+@app.get("/api/data/check-race")
+async def check_for_race(
+    access_token: str = Query(...),
+    goal_distance_km: float = Query(...),
+    after_date: str = Query(...),
+):
+    """Check if a user has completed their goal race since a given date."""
+    after_ts = int(datetime.strptime(after_date, "%Y-%m-%d").timestamp())
+    all_activities = []
+    page = 1
+
+    async with httpx.AsyncClient() as client:
+        while True:
+            resp = await client.get(
+                "https://www.strava.com/api/v3/athlete/activities",
+                headers={"Authorization": f"Bearer {access_token}"},
+                params={"after": after_ts, "per_page": 50, "page": page},
+            )
+            if resp.status_code != 200:
+                break
+            batch = resp.json()
+            if not batch:
+                break
+            all_activities.extend(batch)
+            page += 1
+            if len(batch) < 50:
+                break
+
+    matches = detect_race_results(all_activities, goal_distance_km)
+    return {"matches": matches}
+
+
+# --- Dataset Stats ---
+
+@app.get("/api/data/stats")
+async def dataset_stats():
+    stats = await get_dataset_stats()
+    return stats
+
+
+@app.get("/api/data/export")
+async def dataset_export(admin_key: str = Query(...)):
+    expected = os.environ.get("ADMIN_KEY", "")
+    if not expected or admin_key != expected:
+        raise HTTPException(status_code=403, detail="Invalid admin key")
+    data = await export_training_dataset()
+    return {"count": len(data), "records": data}
 
 
 @app.get("/api/health")
