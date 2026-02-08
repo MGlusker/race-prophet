@@ -43,7 +43,7 @@ export default function Callback() {
         <>
           <div style={{ color: '#ef4444', fontSize: 16 }}>⚠ {error}</div>
           <a href="/" style={{ color: 'var(--accent)', textDecoration: 'none' }}>
-            ← Back to Race Prophet
+            ← Back to Pace Prophet
           </a>
         </>
       ) : (

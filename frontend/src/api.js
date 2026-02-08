@@ -32,7 +32,7 @@ export async function apiPost(path, body = null, params = {}) {
 
 // --- Strava token management ---
 
-const TOKEN_KEY = 'race_prophet_strava';
+const TOKEN_KEY = 'pace_prophet_strava';
 
 export function getStoredToken() {
   try {

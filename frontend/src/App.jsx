@@ -60,6 +60,7 @@ export default function App() {
   const [snapshotId, setSnapshotId] = useState(null);
   const [contributionStatus, setContributionStatus] = useState(null); // 'saved' | 'error'
   const [dataStats, setDataStats] = useState(null);
+  const [showFineTune, setShowFineTune] = useState(false); // Collapsed by default
 
   // Race result detection
   const [detectedRace, setDetectedRace] = useState(null);
@@ -339,14 +340,13 @@ export default function App() {
         {/* Header */}
         <header className="header">
           <div className="header-accent" />
-          <h1 className="title">RACE PROPHET</h1>
+          <h1 className="title">PACE PROPHET</h1>
           <p className="subtitle">Predict your finish time with precision</p>
         </header>
 
         {/* Consent Banner */}
         {showConsentBanner && stravaUser && (
           <div className="consent-banner">
-            <div className="consent-icon">📊</div>
             <div className="consent-content">
               <div className="consent-title">Help improve predictions for everyone</div>
               <div className="consent-text">
@@ -494,47 +494,138 @@ export default function App() {
 
         {/* Input Card */}
         <div className="card">
-          <div className="section-label">
-            {stravaData ? 'FINE-TUNE YOUR INPUT' : 'YOUR RECENT RACE'}
-          </div>
+          {!stravaData && (
+            <>
+              <div className="section-label">YOUR RECENT RACE</div>
 
-          <div className="field-full">
-            <label className="label">Distance</label>
-            <div className="pill-group">
-              {DISTANCES.map((d, i) => (
-                <button
-                  key={d.label}
-                  onClick={() => setRaceDistIdx(i)}
-                  className={`pill ${raceDistIdx === i ? 'pill-active' : ''}`}
-                >
-                  {d.label}
-                </button>
-              ))}
-            </div>
-          </div>
+              <div className="field-full">
+                <label className="label">Distance</label>
+                <div className="pill-group">
+                  {DISTANCES.map((d, i) => (
+                    <button
+                      key={d.label}
+                      onClick={() => setRaceDistIdx(i)}
+                      className={`pill ${raceDistIdx === i ? 'pill-active' : ''}`}
+                    >
+                      {d.label}
+                    </button>
+                  ))}
+                </div>
+              </div>
 
-          <div className="field-full" style={{ marginTop: 16 }}>
-            <label className="label">Finish Time</label>
-            <div className="time-row">
-              <div className="time-group">
-                <input type="number" min="0" max="23" value={hours}
-                  onChange={(e) => setHours(e.target.value)} className="time-input" />
-                <span className="time-label">hr</span>
+              <div className="field-full" style={{ marginTop: 16 }}>
+                <label className="label">Finish Time</label>
+                <div className="time-row">
+                  <div className="time-group">
+                    <input type="number" min="0" max="23" value={hours}
+                      onChange={(e) => setHours(e.target.value)} className="time-input" />
+                    <span className="time-label">hr</span>
+                  </div>
+                  <span className="time-sep">:</span>
+                  <div className="time-group">
+                    <input type="number" min="0" max="59" value={minutes}
+                      onChange={(e) => setMinutes(e.target.value)} className="time-input" />
+                    <span className="time-label">min</span>
+                  </div>
+                  <span className="time-sep">:</span>
+                  <div className="time-group">
+                    <input type="number" min="0" max="59" value={seconds}
+                      onChange={(e) => setSeconds(e.target.value)} className="time-input" />
+                    <span className="time-label">sec</span>
+                  </div>
+                </div>
               </div>
-              <span className="time-sep">:</span>
-              <div className="time-group">
-                <input type="number" min="0" max="59" value={minutes}
-                  onChange={(e) => setMinutes(e.target.value)} className="time-input" />
-                <span className="time-label">min</span>
-              </div>
-              <span className="time-sep">:</span>
-              <div className="time-group">
-                <input type="number" min="0" max="59" value={seconds}
-                  onChange={(e) => setSeconds(e.target.value)} className="time-input" />
-                <span className="time-label">sec</span>
-              </div>
-            </div>
-          </div>
+            </>
+          )}
+
+          {stravaData && (
+            <>
+              <button
+                onClick={() => setShowFineTune(!showFineTune)}
+                className="btn-finetune-toggle"
+              >
+                <span>Tweak your baseline race?</span>
+                <span className="toggle-arrow">{showFineTune ? '▲' : '▼'}</span>
+              </button>
+
+              {showFineTune && (
+                <div className="finetune-content">
+                  <div className="field-full">
+                    <label className="label">Distance</label>
+                    <div className="pill-group">
+                      {DISTANCES.map((d, i) => (
+                        <button
+                          key={d.label}
+                          onClick={() => setRaceDistIdx(i)}
+                          className={`pill ${raceDistIdx === i ? 'pill-active' : ''}`}
+                        >
+                          {d.label}
+                        </button>
+                      ))}
+                    </div>
+                  </div>
+
+                  <div className="field-full" style={{ marginTop: 16 }}>
+                    <label className="label">Finish Time</label>
+                    <div className="time-row">
+                      <div className="time-group">
+                        <input type="number" min="0" max="23" value={hours}
+                          onChange={(e) => setHours(e.target.value)} className="time-input" />
+                        <span className="time-label">hr</span>
+                      </div>
+                      <span className="time-sep">:</span>
+                      <div className="time-group">
+                        <input type="number" min="0" max="59" value={minutes}
+                          onChange={(e) => setMinutes(e.target.value)} className="time-input" />
+                        <span className="time-label">min</span>
+                      </div>
+                      <span className="time-sep">:</span>
+                      <div className="time-group">
+                        <input type="number" min="0" max="59" value={seconds}
+                          onChange={(e) => setSeconds(e.target.value)} className="time-input" />
+                        <span className="time-label">sec</span>
+                      </div>
+                    </div>
+                  </div>
+
+                  <div className="divider" />
+                  <div className="section-label">ADJUSTMENTS</div>
+
+                  <div className="row">
+                    <div className="field">
+                      <label className="label">Weekly Mileage</label>
+                      <input type="number" value={weeklyMiles}
+                        onChange={(e) => setWeeklyMiles(e.target.value)}
+                        className="input" placeholder="e.g. 35" />
+                      <span className="hint">Auto-filled from Strava</span>
+                    </div>
+                    <div className="field">
+                      <label className="label">Age</label>
+                      <input type="number" value={age}
+                        onChange={(e) => setAge(e.target.value)}
+                        className="input" placeholder="e.g. 30" />
+                      {stravaData?.athlete?.age && <span className="hint">From Strava profile</span>}
+                    </div>
+                  </div>
+
+                  <div className="field-full" style={{ marginTop: 8 }}>
+                    <label className="label">Experience Level</label>
+                    <div className="pill-group">
+                      {EXPERIENCE_LEVELS.map((e) => (
+                        <button
+                          key={e.value}
+                          onClick={() => setExperience(e.value)}
+                          className={`pill ${experience === e.value ? 'pill-active' : ''}`}
+                        >
+                          {e.label}
+                        </button>
+                      ))}
+                    </div>
+                  </div>
+                </div>
+              )}
+            </>
+          )}
 
           <div className="divider" />
           <div className="section-label">GOAL RACE</div>
@@ -557,7 +648,7 @@ export default function App() {
           <div className="race-details-section">
             <div className="race-details-header">
               <span className="label" style={{ marginBottom: 0 }}>Training for a specific race?</span>
-              <span className="hint-inline">Optional — helps us track your prediction accuracy</span>
+              <span className="hint-inline">Helps us improve our prediction</span>
             </div>
             <div className="row" style={{ marginTop: 8 }}>
               <div className="field" style={{ flex: 2 }}>
@@ -572,53 +663,55 @@ export default function App() {
               </div>
             </div>
             {goalRaceDate && (
-              <span className="hint" style={{ marginTop: 4 }}>
+              <span className="hint race-countdown">
                 {(() => {
                   const days = Math.ceil((new Date(goalRaceDate) - new Date()) / (1000 * 60 * 60 * 24));
-                  if (days > 0) return `🏃 ${days} days until race day`;
-                  if (days === 0) return '🏁 Race day!';
+                  if (days > 0) return `${days} days until race day!`;
+                  if (days === 0) return 'Race day!';
                   return `Race was ${Math.abs(days)} days ago`;
                 })()}
               </span>
             )}
           </div>
 
-          <div className="divider" />
-          <div className="section-label">ADJUSTMENTS</div>
+          {/* Adjustments for non-Strava users */}
+          {!stravaData && (
+            <>
+              <div className="divider" />
+              <div className="section-label">ADJUSTMENTS</div>
 
-          <div className="row">
-            <div className="field">
-              <label className="label">Weekly Mileage</label>
-              <input type="number" value={weeklyMiles}
-                onChange={(e) => setWeeklyMiles(e.target.value)}
-                className="input" placeholder="e.g. 35" />
-              <span className="hint">
-                {stravaData ? 'Auto-filled from Strava' : 'miles/week average'}
-              </span>
-            </div>
-            <div className="field">
-              <label className="label">Age</label>
-              <input type="number" value={age}
-                onChange={(e) => setAge(e.target.value)}
-                className="input" placeholder="e.g. 30" />
-              {stravaData?.athlete?.age && <span className="hint">From Strava profile</span>}
-            </div>
-          </div>
+              <div className="row">
+                <div className="field">
+                  <label className="label">Weekly Mileage</label>
+                  <input type="number" value={weeklyMiles}
+                    onChange={(e) => setWeeklyMiles(e.target.value)}
+                    className="input" placeholder="e.g. 35" />
+                  <span className="hint">miles/week average</span>
+                </div>
+                <div className="field">
+                  <label className="label">Age</label>
+                  <input type="number" value={age}
+                    onChange={(e) => setAge(e.target.value)}
+                    className="input" placeholder="e.g. 30" />
+                </div>
+              </div>
 
-          <div className="field-full" style={{ marginTop: 8 }}>
-            <label className="label">Experience Level</label>
-            <div className="pill-group">
-              {EXPERIENCE_LEVELS.map((e) => (
-                <button
-                  key={e.value}
-                  onClick={() => setExperience(e.value)}
-                  className={`pill ${experience === e.value ? 'pill-active' : ''}`}
-                >
-                  {e.label}
-                </button>
-              ))}
-            </div>
-          </div>
+              <div className="field-full" style={{ marginTop: 8 }}>
+                <label className="label">Experience Level</label>
+                <div className="pill-group">
+                  {EXPERIENCE_LEVELS.map((e) => (
+                    <button
+                      key={e.value}
+                      onClick={() => setExperience(e.value)}
+                      className={`pill ${experience === e.value ? 'pill-active' : ''}`}
+                    >
+                      {e.label}
+                    </button>
+                  ))}
+                </div>
+              </div>
+            </>
+          )}
 
           <button onClick={calculate} className="btn-calculate">
             PREDICT MY TIME →
@@ -652,12 +745,7 @@ export default function App() {
               </div>
             </div>
 
-            {/* Contribution status */}
-            {contributionStatus === 'saved' && (
-              <div className="contribution-badge">
-                ✓ Training data saved — we'll compare against your actual race to improve predictions
-              </div>
-            )}
+            {/* Contribution status - removed verbose message */}
 
             {/* Detected race result prompt */}
             {showRacePrompt && detectedRace && !raceSubmitted && (
@@ -811,16 +899,11 @@ export default function App() {
         .consent-banner {
           display: flex;
           gap: 16px;
-          background: linear-gradient(135deg, rgba(255, 107, 53, 0.08), rgba(255, 107, 53, 0.02));
-          border: 1px solid rgba(255, 107, 53, 0.25);
+          background: linear-gradient(135deg, rgba(139, 92, 246, 0.08), rgba(139, 92, 246, 0.02));
+          border: 1px solid rgba(139, 92, 246, 0.25);
           border-radius: 12px;
           padding: 20px;
           margin-bottom: 20px;
-        }
-        .consent-icon {
-          font-size: 28px;
-          flex-shrink: 0;
-          margin-top: 2px;
         }
         .consent-content { flex: 1; }
         .consent-title {
@@ -1181,6 +1264,39 @@ export default function App() {
           color: var(--text-faint);
           margin-top: 4px;
           display: block;
+        }
+        .race-countdown {
+          font-size: 14px;
+          font-weight: 600;
+          color: var(--accent);
+          margin-top: 8px;
+        }
+        .btn-finetune-toggle {
+          width: 100%;
+          display: flex;
+          justify-content: space-between;
+          align-items: center;
+          background: var(--surface);
+          border: 1px solid var(--border);
+          border-radius: 8px;
+          padding: 12px 16px;
+          color: var(--text-dim);
+          font-family: var(--font-mono);
+          font-size: 13px;
+          cursor: pointer;
+          transition: all 0.15s;
+          margin-bottom: 16px;
+        }
+        .btn-finetune-toggle:hover {
+          border-color: var(--accent);
+          color: var(--text);
+        }
+        .toggle-arrow {
+          font-size: 10px;
+          color: var(--text-faint);
+        }
+        .finetune-content {
+          padding-bottom: 8px;
         }
         .pill-group {
           display: flex;
