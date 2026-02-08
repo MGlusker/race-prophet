@@ -30,6 +30,36 @@ export async function apiPost(path, body = null, params = {}) {
   return resp.json();
 }
 
+export async function apiPatch(path, body = null, params = {}) {
+  const url = new URL(`${API_BASE}${path}`);
+  Object.entries(params).forEach(([k, v]) => {
+    if (v !== undefined && v !== null) url.searchParams.set(k, v);
+  });
+  const resp = await fetch(url.toString(), {
+    method: 'PATCH',
+    headers: body ? { 'Content-Type': 'application/json' } : {},
+    body: body ? JSON.stringify(body) : undefined,
+  });
+  if (!resp.ok) {
+    const err = await resp.json().catch(() => ({ detail: 'Request failed' }));
+    throw new Error(err.detail || 'Request failed');
+  }
+  return resp.json();
+}
+
+export async function apiDelete(path, params = {}) {
+  const url = new URL(`${API_BASE}${path}`);
+  Object.entries(params).forEach(([k, v]) => {
+    if (v !== undefined && v !== null) url.searchParams.set(k, v);
+  });
+  const resp = await fetch(url.toString(), { method: 'DELETE' });
+  if (!resp.ok) {
+    const err = await resp.json().catch(() => ({ detail: 'Request failed' }));
+    throw new Error(err.detail || 'Request failed');
+  }
+  return resp.json();
+}
+
 // --- Strava token management ---
 
 const TOKEN_KEY = 'pace_prophet_strava';

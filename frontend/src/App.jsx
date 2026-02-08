@@ -344,6 +344,18 @@ export default function App() {
           <p className="subtitle">Predict your finish time with precision</p>
         </header>
 
+        {/* Navigation Tabs */}
+        <nav className="nav-tabs">
+          <a href="/" className="nav-tab nav-tab-active">Predictor</a>
+          <a
+            href={stravaUser ? "/dashboard" : "#"}
+            className={`nav-tab ${!stravaUser ? 'nav-tab-disabled' : ''}`}
+            onClick={e => { if (!stravaUser) e.preventDefault(); }}
+          >
+            Dashboard
+          </a>
+        </nav>
+
         {/* Consent Banner */}
         {showConsentBanner && stravaUser && (
           <div className="consent-banner">
@@ -893,6 +905,41 @@ export default function App() {
           color: var(--text-muted);
           margin-top: 6px;
           letter-spacing: 0.04em;
+        }
+
+        /* Navigation tabs */
+        .nav-tabs {
+          display: flex;
+          gap: 0;
+          margin-bottom: 20px;
+          background: var(--bg-card);
+          border: 1px solid var(--border);
+          border-radius: 10px;
+          overflow: hidden;
+        }
+        .nav-tab {
+          flex: 1;
+          text-align: center;
+          padding: 12px 16px;
+          font-family: var(--font-mono);
+          font-size: 12px;
+          font-weight: 600;
+          letter-spacing: 0.1em;
+          text-transform: uppercase;
+          text-decoration: none;
+          color: var(--text-muted);
+          transition: all 0.15s;
+          cursor: pointer;
+        }
+        .nav-tab:hover:not(.nav-tab-disabled) { color: var(--text); background: var(--surface); }
+        .nav-tab-active {
+          color: #fff;
+          background: var(--accent);
+        }
+        .nav-tab-active:hover { color: #fff; background: var(--accent); }
+        .nav-tab-disabled {
+          opacity: 0.4;
+          cursor: not-allowed;
         }
 
         /* Consent banner */

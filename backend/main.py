@@ -1,5 +1,4 @@
 import os
-import math
 import uuid
 import httpx
 from dotenv import load_dotenv
@@ -17,7 +16,13 @@ from database import (
     get_dataset_stats, export_training_dataset,
     store_tokens, store_pending_prediction, expire_old_predictions,
     store_webhook_state, get_webhook_state,
+    get_or_create_user, get_user_by_strava_id,
+    create_goal_race, get_active_goal_races, get_goal_race,
+    update_goal_race_status, delete_goal_race,
+    store_prediction, get_prediction_history, get_latest_prediction,
+    get_training_summary,
 )
+from prediction_engine import calculate_prediction, format_time, DISTANCES, EXPERIENCE_FACTORS
 from training_processor import process_training_data, detect_race_results
 from webhook_handler import process_activity_event
 
@@ -90,6 +95,14 @@ async def exchange_token(code: str = Query(...)):
         access_token=data["access_token"],
         refresh_token=data["refresh_token"],
         expires_at=data["expires_at"],
+    )
+
+    # Create or update user record for dashboard features
+    await get_or_create_user(
+        strava_athlete_id=data["athlete"]["id"],
+        firstname=data["athlete"].get("firstname", ""),
+        lastname=data["athlete"].get("lastname", ""),
+        profile_url=data["athlete"].get("profile_medium", ""),
     )
 
     return {
@@ -397,34 +410,7 @@ def find_best_efforts(runs):
     return best
 
 
-def format_time(total_seconds):
-    h = total_seconds // 3600
-    m = (total_seconds % 3600) // 60
-    s = total_seconds % 60
-    if h > 0:
-        return f"{h}:{m:02d}:{s:02d}"
-    return f"{m}:{s:02d}"
-
-
 # --- Prediction Engine ---
-
-DISTANCES = {
-    "1 Mile": 1.60934,
-    "5K": 5.0,
-    "10K": 10.0,
-    "15K": 15.0,
-    "Half Marathon": 21.0975,
-    "Marathon": 42.195,
-    "50K": 50.0,
-}
-
-EXPERIENCE_FACTORS = {
-    "beginner": 1.06,
-    "intermediate": 1.0,
-    "advanced": 0.97,
-    "elite": 0.94,
-}
-
 
 class PredictionRequest(BaseModel):
     race_time_seconds: int
@@ -437,68 +423,14 @@ class PredictionRequest(BaseModel):
 
 @app.post("/api/predict")
 def predict(req: PredictionRequest):
-    exponent = 1.06
-
-    if req.weekly_miles:
-        if req.weekly_miles >= 60:
-            exponent -= 0.03
-        elif req.weekly_miles >= 45:
-            exponent -= 0.02
-        elif req.weekly_miles >= 30:
-            exponent -= 0.01
-        elif req.weekly_miles < 15:
-            exponent += 0.02
-
-    exp_factor = EXPERIENCE_FACTORS.get(req.experience, 1.0)
-
-    age_factor = 1.0
-    if req.age and req.age > 0:
-        if req.age < 20:
-            age_factor = 1.03
-        elif req.age <= 35:
-            age_factor = 1.0
-        elif req.age <= 45:
-            age_factor = 1.0 + (req.age - 35) * 0.004
-        elif req.age <= 55:
-            age_factor = 1.04 + (req.age - 45) * 0.006
-        elif req.age <= 65:
-            age_factor = 1.10 + (req.age - 55) * 0.008
-        else:
-            age_factor = 1.18 + (req.age - 65) * 0.01
-
-    raw = req.race_time_seconds * math.pow(
-        req.goal_distance_km / req.race_distance_km, exponent
+    return calculate_prediction(
+        race_time_seconds=req.race_time_seconds,
+        race_distance_km=req.race_distance_km,
+        goal_distance_km=req.goal_distance_km,
+        weekly_miles=req.weekly_miles or 0,
+        age=req.age or 0,
+        experience=req.experience or "intermediate",
     )
-    adjusted = raw * exp_factor * age_factor
-
-    dist_ratio = req.goal_distance_km / req.race_distance_km
-    uncertainty = min(0.06, 0.03 + abs(math.log(dist_ratio)) * 0.008)
-
-    pace_per_mile = (adjusted / req.goal_distance_km) * 1.60934
-    pace_per_km = adjusted / req.goal_distance_km
-
-    equivalents = {}
-    for label, dist in DISTANCES.items():
-        eq_raw = req.race_time_seconds * math.pow(dist / req.race_distance_km, exponent)
-        eq_adj = eq_raw * exp_factor * age_factor
-        equivalents[label] = {
-            "time_seconds": round(eq_adj),
-            "time_formatted": format_time(round(eq_adj)),
-            "pace_per_mile": format_time(round((eq_adj / dist) * 1.60934)),
-        }
-
-    return {
-        "predicted_seconds": round(adjusted),
-        "predicted_formatted": format_time(round(adjusted)),
-        "low_seconds": round(adjusted * (1 - uncertainty)),
-        "low_formatted": format_time(round(adjusted * (1 - uncertainty))),
-        "high_seconds": round(adjusted * (1 + uncertainty)),
-        "high_formatted": format_time(round(adjusted * (1 + uncertainty))),
-        "uncertainty_pct": round(uncertainty * 100, 1),
-        "pace_per_mile": format_time(round(pace_per_mile)),
-        "pace_per_km": format_time(round(pace_per_km)),
-        "equivalents": equivalents,
-    }
 
 
 # --- Data Collection Endpoints ---
@@ -702,6 +634,156 @@ async def dataset_export(admin_key: str = Query(...)):
     return {"count": len(data), "records": data}
 
 
+# --- Dashboard / Goal Race Endpoints ---
+
+async def get_current_user(access_token: str) -> dict:
+    """Fetch athlete from Strava, then get or create local user."""
+    async with httpx.AsyncClient() as client:
+        resp = await client.get(
+            "https://www.strava.com/api/v3/athlete",
+            headers={"Authorization": f"Bearer {access_token}"},
+        )
+    if resp.status_code != 200:
+        raise HTTPException(status_code=401, detail="Invalid Strava token")
+    athlete = resp.json()
+    user = await get_or_create_user(
+        strava_athlete_id=athlete["id"],
+        firstname=athlete.get("firstname", ""),
+        lastname=athlete.get("lastname", ""),
+        profile_url=athlete.get("profile_medium", ""),
+    )
+    if not user:
+        raise HTTPException(status_code=500, detail="Database not available")
+    return user
+
+
+class GoalRaceCreate(BaseModel):
+    name: str
+    distance_km: float
+    baseline_distance_km: float
+    baseline_time_seconds: int
+    race_date: Optional[str] = None
+    goal_time_seconds: Optional[int] = None
+    experience: Optional[str] = "intermediate"
+    age: Optional[int] = None
+    weekly_miles: Optional[float] = None
+
+
+class GoalRaceUpdate(BaseModel):
+    status: str  # 'completed' | 'cancelled'
+
+
+@app.get("/api/me/profile")
+async def get_profile(access_token: str = Query(...)):
+    user = await get_current_user(access_token)
+    return {
+        "id": user["id"],
+        "strava_athlete_id": user["strava_athlete_id"],
+        "firstname": user["firstname"],
+        "lastname": user["lastname"],
+        "profile_url": user["profile_url"],
+    }
+
+
+@app.post("/api/me/goal-races")
+async def create_goal_race_endpoint(req: GoalRaceCreate, access_token: str = Query(...)):
+    user = await get_current_user(access_token)
+    race = await create_goal_race(
+        user_id=user["id"],
+        name=req.name,
+        distance_km=req.distance_km,
+        baseline_distance_km=req.baseline_distance_km,
+        baseline_time_seconds=req.baseline_time_seconds,
+        race_date=req.race_date,
+        goal_time_seconds=req.goal_time_seconds,
+        experience=req.experience or "intermediate",
+        age=req.age,
+    )
+    if not race:
+        raise HTTPException(status_code=500, detail="Failed to create goal race")
+
+    # Calculate initial prediction
+    pred = calculate_prediction(
+        race_time_seconds=req.baseline_time_seconds,
+        race_distance_km=req.baseline_distance_km,
+        goal_distance_km=req.distance_km,
+        weekly_miles=req.weekly_miles or 0,
+        age=req.age or 0,
+        experience=req.experience or "intermediate",
+    )
+
+    await store_prediction(
+        goal_race_id=race["id"],
+        user_id=user["id"],
+        predicted_seconds=pred["predicted_seconds"],
+        low_seconds=pred["low_seconds"],
+        high_seconds=pred["high_seconds"],
+        uncertainty_pct=pred["uncertainty_pct"],
+        pace_per_mile=pred["pace_per_mile"],
+        pace_per_km=pred["pace_per_km"],
+        avg_weekly_miles=req.weekly_miles,
+        triggered_by="manual",
+    )
+
+    latest = await get_latest_prediction(race["id"])
+    race["latest_prediction"] = latest
+    return race
+
+
+@app.get("/api/me/goal-races")
+async def list_goal_races_endpoint(access_token: str = Query(...)):
+    user = await get_current_user(access_token)
+    races = await get_active_goal_races(user["id"])
+    for race in races:
+        latest = await get_latest_prediction(race["id"])
+        race["latest_prediction"] = latest
+    return races
+
+
+@app.get("/api/me/goal-races/{goal_race_id}/predictions")
+async def get_predictions_endpoint(goal_race_id: int, access_token: str = Query(...)):
+    user = await get_current_user(access_token)
+    race = await get_goal_race(goal_race_id)
+    if not race or race["user_id"] != user["id"]:
+        raise HTTPException(status_code=404, detail="Goal race not found")
+    history = await get_prediction_history(goal_race_id)
+    return {"goal_race": race, "predictions": history}
+
+
+@app.patch("/api/me/goal-races/{goal_race_id}")
+async def update_goal_race_endpoint(
+    goal_race_id: int, req: GoalRaceUpdate, access_token: str = Query(...)
+):
+    user = await get_current_user(access_token)
+    race = await get_goal_race(goal_race_id)
+    if not race or race["user_id"] != user["id"]:
+        raise HTTPException(status_code=404, detail="Goal race not found")
+    if req.status not in ("completed", "cancelled"):
+        raise HTTPException(status_code=400, detail="Status must be 'completed' or 'cancelled'")
+    updated = await update_goal_race_status(goal_race_id, req.status)
+    return updated
+
+
+@app.delete("/api/me/goal-races/{goal_race_id}")
+async def delete_goal_race_endpoint(goal_race_id: int, access_token: str = Query(...)):
+    user = await get_current_user(access_token)
+    race = await get_goal_race(goal_race_id)
+    if not race or race["user_id"] != user["id"]:
+        raise HTTPException(status_code=404, detail="Goal race not found")
+    await delete_goal_race(goal_race_id)
+    return {"status": "deleted"}
+
+
+@app.get("/api/me/training")
+async def get_training_endpoint(
+    access_token: str = Query(...),
+    weeks: int = Query(default=16, ge=1, le=52),
+):
+    user = await get_current_user(access_token)
+    summary = await get_training_summary(user["id"], weeks)
+    return summary
+
+
 @app.get("/api/health")
 def health():
     return {"status": "ok", "strava_configured": bool(STRAVA_CLIENT_ID)}
@@ -723,6 +805,8 @@ async def run_migrations(admin_key: str = Query(...)):
         "ALTER TABLE pending_predictions ADD COLUMN IF NOT EXISTS goal_race_name TEXT",
         "ALTER TABLE pending_predictions ADD COLUMN IF NOT EXISTS goal_race_date DATE",
         "ALTER TABLE pending_predictions ADD COLUMN IF NOT EXISTS match_window_days INT DEFAULT 3",
+        "ALTER TABLE training_log ADD COLUMN IF NOT EXISTS user_id INT REFERENCES users(id)",
+        "ALTER TABLE training_log ADD COLUMN IF NOT EXISTS activity_name TEXT",
     ]
 
     results = []

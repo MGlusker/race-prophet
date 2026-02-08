@@ -16,7 +16,10 @@ from database import (
     get_tokens, update_tokens, get_pending_predictions,
     match_prediction, store_race_result, get_consent,
     log_activity,
+    get_user_by_strava_id, get_active_goal_races,
+    get_training_summary, store_prediction,
 )
+from prediction_engine import calculate_prediction
 
 STRAVA_CLIENT_ID = os.environ.get("STRAVA_CLIENT_ID", "")
 STRAVA_CLIENT_SECRET = os.environ.get("STRAVA_CLIENT_SECRET", "")
@@ -170,4 +173,58 @@ async def process_activity_event(athlete_id: int, activity_id: int) -> dict:
         )
         return result
 
+    # --- Step 3: Auto-recalculate predictions for active goal races ---
+    try:
+        await recalculate_goal_race_predictions(athlete_id, activity_id)
+    except Exception as e:
+        print(f"Goal race recalculation error (non-fatal): {e}")
+
     return result
+
+
+async def recalculate_goal_race_predictions(athlete_id: int, activity_id: int):
+    """Recalculate predictions for all active goal races after a new activity."""
+    user = await get_user_by_strava_id(athlete_id)
+    if not user:
+        return
+
+    races = await get_active_goal_races(user["id"])
+    if not races:
+        return
+
+    summary = await get_training_summary(user["id"], weeks=16)
+    avg_weekly_miles = summary.get("avg_weekly_miles", 0) if summary else 0
+    total_runs = summary.get("total_runs", 0) if summary else 0
+    longest_run_mi = summary.get("longest_run_mi", 0) if summary else 0
+
+    for race in races:
+        try:
+            pred = calculate_prediction(
+                race_time_seconds=race["baseline_time_seconds"],
+                race_distance_km=race["baseline_distance_km"],
+                goal_distance_km=race["distance_km"],
+                weekly_miles=avg_weekly_miles,
+                age=race.get("age") or 0,
+                experience=race.get("experience") or "intermediate",
+            )
+
+            await store_prediction(
+                goal_race_id=race["id"],
+                user_id=user["id"],
+                predicted_seconds=pred["predicted_seconds"],
+                low_seconds=pred["low_seconds"],
+                high_seconds=pred["high_seconds"],
+                uncertainty_pct=pred["uncertainty_pct"],
+                pace_per_mile=pred["pace_per_mile"],
+                pace_per_km=pred["pace_per_km"],
+                avg_weekly_miles=avg_weekly_miles,
+                total_runs=total_runs,
+                longest_run_mi=longest_run_mi,
+                triggered_by="webhook",
+                triggered_by_activity_id=activity_id,
+            )
+
+            print(f"Goal race prediction updated: race={race['name']}, "
+                  f"predicted={pred['predicted_formatted']}, weekly_miles={avg_weekly_miles}")
+        except Exception as e:
+            print(f"Failed to recalculate for goal race {race['id']}: {e}")

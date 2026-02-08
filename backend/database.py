@@ -186,6 +186,54 @@ async def create_tables():
                 UNIQUE(athlete_hash, strava_activity_id)
             );
 
+            -- Users table (maps strava ID to internal user)
+            CREATE TABLE IF NOT EXISTS users (
+                id SERIAL PRIMARY KEY,
+                strava_athlete_id BIGINT UNIQUE NOT NULL,
+                athlete_hash TEXT NOT NULL,
+                firstname TEXT,
+                lastname TEXT,
+                profile_url TEXT,
+                created_at TIMESTAMPTZ DEFAULT NOW(),
+                updated_at TIMESTAMPTZ DEFAULT NOW()
+            );
+
+            -- Goal races
+            CREATE TABLE IF NOT EXISTS goal_races (
+                id SERIAL PRIMARY KEY,
+                user_id INT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                name TEXT NOT NULL,
+                distance_km REAL NOT NULL,
+                race_date DATE,
+                goal_time_seconds INT,
+                baseline_distance_km REAL NOT NULL,
+                baseline_time_seconds INT NOT NULL,
+                experience TEXT DEFAULT 'intermediate',
+                age INT,
+                status TEXT DEFAULT 'active',
+                created_at TIMESTAMPTZ DEFAULT NOW(),
+                updated_at TIMESTAMPTZ DEFAULT NOW()
+            );
+
+            -- Prediction history for goal races
+            CREATE TABLE IF NOT EXISTS prediction_history (
+                id SERIAL PRIMARY KEY,
+                goal_race_id INT NOT NULL REFERENCES goal_races(id) ON DELETE CASCADE,
+                user_id INT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                predicted_seconds INT NOT NULL,
+                low_seconds INT,
+                high_seconds INT,
+                uncertainty_pct REAL,
+                pace_per_mile TEXT,
+                pace_per_km TEXT,
+                avg_weekly_miles REAL,
+                total_runs INT,
+                longest_run_mi REAL,
+                triggered_by TEXT DEFAULT 'manual',
+                triggered_by_activity_id BIGINT,
+                created_at TIMESTAMPTZ DEFAULT NOW()
+            );
+
             -- Indexes
             CREATE INDEX IF NOT EXISTS idx_snapshots_athlete ON training_snapshots(athlete_hash);
             CREATE INDEX IF NOT EXISTS idx_results_athlete ON race_results(athlete_hash);
@@ -195,6 +243,10 @@ async def create_tables():
             CREATE INDEX IF NOT EXISTS idx_tokens_hash ON athlete_tokens(athlete_hash);
             CREATE INDEX IF NOT EXISTS idx_training_log_athlete ON training_log(athlete_hash, activity_date);
             CREATE INDEX IF NOT EXISTS idx_training_log_activity ON training_log(strava_activity_id);
+            CREATE INDEX IF NOT EXISTS idx_users_strava ON users(strava_athlete_id);
+            CREATE INDEX IF NOT EXISTS idx_goal_races_user ON goal_races(user_id, status);
+            CREATE INDEX IF NOT EXISTS idx_prediction_history_goal ON prediction_history(goal_race_id, created_at);
+            CREATE INDEX IF NOT EXISTS idx_prediction_history_user ON prediction_history(user_id);
         """)
 
 
@@ -251,6 +303,8 @@ async def delete_athlete_data(strava_athlete_id: int):
     athlete_hash = hash_athlete_id(strava_athlete_id)
     async with pool.acquire() as conn:
         async with conn.transaction():
+            # Delete user-related data (cascades to goal_races and prediction_history)
+            await conn.execute("DELETE FROM users WHERE strava_athlete_id = $1", strava_athlete_id)
             await conn.execute("DELETE FROM race_results WHERE athlete_hash = $1", athlete_hash)
             await conn.execute("DELETE FROM training_snapshots WHERE athlete_hash = $1", athlete_hash)
             await conn.execute("DELETE FROM training_log WHERE athlete_hash = $1", athlete_hash)
@@ -590,6 +644,8 @@ async def get_dataset_stats() -> dict:
         result_count = await conn.fetchval("SELECT COUNT(*) FROM race_results")
         pending_count = await conn.fetchval("SELECT COUNT(*) FROM pending_predictions WHERE status = 'pending'")
         log_count = await conn.fetchval("SELECT COUNT(*) FROM training_log")
+        user_count = await conn.fetchval("SELECT COUNT(*) FROM users")
+        goal_race_count = await conn.fetchval("SELECT COUNT(*) FROM goal_races WHERE status = 'active'")
 
         error_stats = await conn.fetchrow("""
             SELECT COUNT(*) as n,
@@ -607,6 +663,8 @@ async def get_dataset_stats() -> dict:
             "race_results": result_count,
             "pending_predictions": pending_count,
             "training_log_entries": log_count,
+            "dashboard_users": user_count,
+            "active_goal_races": goal_race_count,
             "model_accuracy": {
                 "sample_count": error_stats["n"] if error_stats else 0,
                 "mae_seconds": round(error_stats["mae"], 1) if error_stats and error_stats["mae"] else None,
@@ -639,3 +697,172 @@ async def export_training_dataset() -> list:
             ORDER BY rr.created_at
         """)
         return [dict(r) for r in rows]
+
+
+# --- Users ---
+
+async def get_or_create_user(
+    strava_athlete_id: int,
+    firstname: str = "",
+    lastname: str = "",
+    profile_url: str = "",
+) -> Optional[dict]:
+    if not pool: return None
+    athlete_hash = hash_athlete_id(strava_athlete_id)
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow("""
+            INSERT INTO users (strava_athlete_id, athlete_hash, firstname, lastname, profile_url)
+            VALUES ($1, $2, $3, $4, $5)
+            ON CONFLICT (strava_athlete_id) DO UPDATE SET
+                firstname = COALESCE(NULLIF($3, ''), users.firstname),
+                lastname = COALESCE(NULLIF($4, ''), users.lastname),
+                profile_url = COALESCE(NULLIF($5, ''), users.profile_url),
+                updated_at = NOW()
+            RETURNING id, strava_athlete_id, athlete_hash, firstname, lastname, profile_url, created_at
+        """, strava_athlete_id, athlete_hash, firstname, lastname, profile_url)
+        return dict(row) if row else None
+
+
+async def get_user_by_strava_id(strava_athlete_id: int) -> Optional[dict]:
+    if not pool: return None
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(
+            "SELECT * FROM users WHERE strava_athlete_id = $1", strava_athlete_id)
+        return dict(row) if row else None
+
+
+# --- Goal Races ---
+
+async def create_goal_race(
+    user_id: int,
+    name: str,
+    distance_km: float,
+    baseline_distance_km: float,
+    baseline_time_seconds: int,
+    race_date: Optional[str] = None,
+    goal_time_seconds: Optional[int] = None,
+    experience: str = "intermediate",
+    age: Optional[int] = None,
+) -> Optional[dict]:
+    if not pool: return None
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow("""
+            INSERT INTO goal_races (
+                user_id, name, distance_km, race_date, goal_time_seconds,
+                baseline_distance_km, baseline_time_seconds, experience, age
+            ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+            RETURNING *
+        """,
+            user_id, name, distance_km,
+            datetime.strptime(race_date, "%Y-%m-%d").date() if race_date else None,
+            goal_time_seconds,
+            baseline_distance_km, baseline_time_seconds,
+            experience, age,
+        )
+        return dict(row) if row else None
+
+
+async def get_active_goal_races(user_id: int) -> list:
+    if not pool: return []
+    async with pool.acquire() as conn:
+        rows = await conn.fetch("""
+            SELECT * FROM goal_races
+            WHERE user_id = $1 AND status = 'active'
+            ORDER BY race_date ASC NULLS LAST, created_at DESC
+        """, user_id)
+        return [dict(r) for r in rows]
+
+
+async def get_goal_race(goal_race_id: int) -> Optional[dict]:
+    if not pool: return None
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow("SELECT * FROM goal_races WHERE id = $1", goal_race_id)
+        return dict(row) if row else None
+
+
+async def update_goal_race_status(goal_race_id: int, status: str) -> Optional[dict]:
+    if not pool: return None
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow("""
+            UPDATE goal_races SET status = $2, updated_at = NOW()
+            WHERE id = $1 RETURNING *
+        """, goal_race_id, status)
+        return dict(row) if row else None
+
+
+async def delete_goal_race(goal_race_id: int):
+    if not pool: return
+    async with pool.acquire() as conn:
+        await conn.execute("DELETE FROM goal_races WHERE id = $1", goal_race_id)
+
+
+# --- Prediction History ---
+
+async def store_prediction(
+    goal_race_id: int,
+    user_id: int,
+    predicted_seconds: int,
+    low_seconds: int = None,
+    high_seconds: int = None,
+    uncertainty_pct: float = None,
+    pace_per_mile: str = None,
+    pace_per_km: str = None,
+    avg_weekly_miles: float = None,
+    total_runs: int = None,
+    longest_run_mi: float = None,
+    triggered_by: str = "manual",
+    triggered_by_activity_id: int = None,
+) -> Optional[int]:
+    if not pool: return None
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow("""
+            INSERT INTO prediction_history (
+                goal_race_id, user_id, predicted_seconds,
+                low_seconds, high_seconds, uncertainty_pct,
+                pace_per_mile, pace_per_km,
+                avg_weekly_miles, total_runs, longest_run_mi,
+                triggered_by, triggered_by_activity_id
+            ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)
+            RETURNING id
+        """,
+            goal_race_id, user_id, predicted_seconds,
+            low_seconds, high_seconds, uncertainty_pct,
+            pace_per_mile, pace_per_km,
+            avg_weekly_miles, total_runs, longest_run_mi,
+            triggered_by, triggered_by_activity_id,
+        )
+        return row["id"] if row else None
+
+
+async def get_prediction_history(goal_race_id: int) -> list:
+    if not pool: return []
+    async with pool.acquire() as conn:
+        rows = await conn.fetch("""
+            SELECT * FROM prediction_history
+            WHERE goal_race_id = $1
+            ORDER BY created_at ASC
+        """, goal_race_id)
+        return [dict(r) for r in rows]
+
+
+async def get_latest_prediction(goal_race_id: int) -> Optional[dict]:
+    if not pool: return None
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow("""
+            SELECT * FROM prediction_history
+            WHERE goal_race_id = $1
+            ORDER BY created_at DESC LIMIT 1
+        """, goal_race_id)
+        return dict(row) if row else None
+
+
+# --- Training Summary (from training_log, for dashboard) ---
+
+async def get_training_summary(user_id: int, weeks: int = 16) -> dict:
+    """Get training summary for a user from training_log via their athlete_hash."""
+    if not pool: return {}
+    async with pool.acquire() as conn:
+        user = await conn.fetchrow("SELECT athlete_hash FROM users WHERE id = $1", user_id)
+        if not user:
+            return {}
+    return await get_training_log_stats(user["athlete_hash"], weeks)
