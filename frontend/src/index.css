@@ -1,0 +1,13 @@
+* { margin: 0; padding: 0; box-sizing: border-box; }
+:root {
+  --bg: #0a0e17; --bg-card: rgba(18, 23, 35, 0.6); --border: #1e2538;
+  --text: #e8e6e1; --text-dim: #9ca3af; --text-muted: #6b7280; --text-faint: #4b5563;
+  --accent: #ff6b35; --accent-glow: rgba(255, 107, 53, 0.4); --surface: #0d1117;
+  --font-mono: 'JetBrains Mono', 'SF Mono', monospace;
+  --font-display: 'Space Grotesk', sans-serif;
+}
+body { background-color: var(--bg); color: var(--text); font-family: var(--font-mono); -webkit-font-smoothing: antialiased; }
+input[type="number"]::-webkit-inner-spin-button,
+input[type="number"]::-webkit-outer-spin-button { -webkit-appearance: none; margin: 0; }
+input[type="number"] { -moz-appearance: textfield; }
+::selection { background: var(--accent); color: white; }
